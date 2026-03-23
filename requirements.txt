@@ -1,0 +1,55 @@
+# ======================================================
+# Produto Tecnológico — SIG–AHP + Redes Neurais
+# Requisitos de software (Python >= 3.10)
+# ======================================================
+
+# ----------------------
+# Núcleo científico
+# ----------------------
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.11.4
+
+# ----------------------
+# Visualização
+# ----------------------
+matplotlib==3.8.4
+seaborn==0.13.2
+
+# ----------------------
+# Machine Learning
+# ----------------------
+scikit-learn==1.4.2
+
+# ----------------------
+# Deep Learning
+# ----------------------
+tensorflow==2.15.0
+keras==2.15.0
+
+# ----------------------
+# Séries temporais / utilidades
+# ----------------------
+statsmodels==0.14.2
+tqdm==4.66.4
+
+# ----------------------
+# Geoprocessamento (local)
+# ----------------------
+geopandas==0.14.4
+shapely==2.0.4
+rasterio==1.3.10
+pyproj==3.6.1
+fiona==1.9.6
+
+# ----------------------
+# Google Earth Engine / geemap
+# ----------------------
+earthengine-api==0.1.405
+geemap==0.32.1
+
+# ----------------------
+# Notebooks (opcional, mas recomendado)
+# ----------------------
+jupyterlab==4.2.1
+ipykernel==6.29.4
