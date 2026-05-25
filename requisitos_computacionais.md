@@ -2,7 +2,7 @@
 
 Este documento descreve os requisitos mínimos para reproduzir e executar o produto tecnológico (SIG–AHP + RNAs) desenvolvido nesta dissertação.
 
----
+-------
 
 ## 1) Requisitos de Hardware
 
@@ -20,7 +20,7 @@ Este documento descreve os requisitos mínimos para reproduzir e executar o prod
 
 > Observação: o produto pode ser executado sem GPU, porém o treinamento das RNAs pode levar mais tempo.
 
----
+-------
 
 ## 2) Requisitos de Software
 
