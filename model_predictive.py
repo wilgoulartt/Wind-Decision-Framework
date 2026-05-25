@@ -38,6 +38,7 @@ SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+# ==========================================================
 LOOKBACK = 24
 H_MAX = 12
 H_EVAL = [3, 6, 12]
@@ -56,12 +57,12 @@ VAL_END   = "2024-07-01"  # [TRAIN_END, VAL_END) = validação; >= VAL_END = tes
 def ajustar_velocidade_altura(v_ref, z_ref=10, z_dest=80, z0=0.1):
     return v_ref * (np.log(z_dest / z0) / np.log(z_ref / z0))
 
-
+# ==========================================================
 def mae_rmse(y_true, y_pred):
     mae = float(mean_absolute_error(y_true, y_pred))
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     return mae, rmse
-
+# ==========================================================
 
 def split_masks_hourly(df):
     dt = df["datetime"]
@@ -70,7 +71,7 @@ def split_masks_hourly(df):
     test_mask  = dt >= pd.Timestamp(VAL_END)
     return train_mask, val_mask, test_mask
 
-
+# ==========================================================
 def add_time_features(df):
     dt = df["datetime"]
     hour = dt.dt.hour
@@ -93,7 +94,7 @@ def fit_scalers(train_df, features, target):
         sd_y = 1.0
     return mu, sd, float(mu_y), float(sd_y)
 
-
+# ==========================================================
 def apply_scalers(df, mu, sd, mu_y, sd_y, features, target):
     X = ((df[features] - mu) / sd).values.astype(np.float32)
     y = ((df[target] - mu_y) / sd_y).values.astype(np.float32)
