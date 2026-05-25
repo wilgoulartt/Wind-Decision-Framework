@@ -9,7 +9,7 @@ Este repositório corresponde ao **produto tecnológico** desenvolvido no âmbit
 uma dissertação de mestrado acadêmico, atendendo às diretrizes da CAPES para
 produção técnica e tecnológica.
 
----
+-----
 
 ##  Visão Geral
 
