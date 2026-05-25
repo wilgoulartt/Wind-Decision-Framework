@@ -102,7 +102,7 @@ def apply_scalers(df, mu, sd, mu_y, sd_y, features, target):
 
 
 # ==========================================================
-# Dataset multi-horizonte (NÃO Seq2Seq)
+# Dataset multi-horizonte 
 # X: (N, LOOKBACK, F)
 # Y: (N, H_MAX) -> y(t+1..t+Hmax) normalizado
 # y_t_real: (N,) -> y(t) em real (persistência)
@@ -146,10 +146,676 @@ def make_multiH_sequences_per_id(df_split, lookback, h_max,
 
     return X_out, Y_out, t0_out, id_out, y_t_real_out
 
+#=======================================
+#=======================================
+MLP 
+#=======================================
+#=======================================
 
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
+def eval_mae_rmse(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    return mae, rmse
+
+def make_model(features_num, features_cat, random_state=42):
+    numeric_pipe = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    categorical_pipe = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("num", numeric_pipe, features_num),
+            ("cat", categorical_pipe, features_cat)
+        ]
+    )
+
+    mlp = MLPRegressor(
+        hidden_layer_sizes=(128, 64),
+        activation="relu",
+        solver="adam",
+        alpha=1e-4,
+        learning_rate_init=1e-3,
+        max_iter=600,
+        random_state=random_state
+    )
+
+    return Pipeline(steps=[("prep", preprocess), ("mlp", mlp)])
+
+# =========================
+# 0) GARANTIR DF BASE (dfh)
+# =========================
+# dfh deve conter:
+# id, datetime, u10, v10, elevation, slope, wind_speed_80m
+# + features temporais (hour_sin/cos, doy_sin/cos)
+# + lags ws80_lag1,2,3,6,12,24
+
+# Se ainda não tiver: ordene e crie lags
+dfh = dfh.sort_values(["id", "datetime"]).reset_index(drop=True)
+
+LAGS = [1, 2, 3, 6, 12, 24]  # +2d, +3d, +7d
+for L in LAGS:
+    dfh[f"ws80_lag{L}"] = dfh.groupby("id")["wind_speed_80m"].shift(L)
+
+# =========================
+# 1) DEFINIÇÃO DE FEATURES
+# =========================
+features_num = [
+    "u10","v10","elevation","slope",
+    "hour_sin","hour_cos","doy_sin","doy_cos",
+] + [f"ws80_lag{L}" for L in LAGS]
+
+
+# =========================
+# 2) SPLIT TEMPORAL FIXO
+# =========================
+def split_masks(df):
+    train_mask = df["datetime"] < pd.Timestamp("2024-01-01")
+    val_mask   = (df["datetime"] >= pd.Timestamp("2024-01-01")) & (df["datetime"] < pd.Timestamp("2024-07-01"))
+    test_mask  = df["datetime"] >= pd.Timestamp("2024-07-01")
+    return train_mask, val_mask, test_mask
+
+# =========================
+# 3) RODAR MULTI-HORIZONTES
+# =========================
+horizontes = [3, 6, 12]  # horas à frente
+
+resultados = []
+
+for H in horizontes:
+    dfm = dfh.copy()
+    dfm["y_target"] = dfm.groupby("id")["wind_speed_80m"].shift(-H)
+
+    # remover linhas sem lags/target
+    need_cols = [f"ws80_lag{L}" for L in LAGS] + ["y_target"]
+    dfm = dfm.dropna(subset=need_cols)
+    #dfm = dfm.dropna(subset=need_cols).copy()
+
+    train_mask, val_mask, test_mask = split_masks(dfm)
+
+    train_df = dfm.loc[train_mask]
+    val_df   = dfm.loc[val_mask]
+    test_df  = dfm.loc[test_mask]
+
+    X_train, y_train = train_df[features_num + features_cat], train_df["y_target"]
+    X_val, y_val     = val_df[features_num + features_cat], val_df["y_target"]
+    X_test, y_test   = test_df[features_num + features_cat], test_df["y_target"]
+
+    model = make_model(features_num, features_cat, random_state=42)
+    model.fit(X_train, y_train)
+
+    pred_val  = model.predict(X_val)
+    pred_test = model.predict(X_test)
+
+    # Baseline persistência para horizonte H:
+    # previsão = valor atual (t) para estimar t+H
+    baseline_val  = val_df["wind_speed_80m"].values
+    baseline_test = test_df["wind_speed_80m"].values
+
+    mae_val,  rmse_val  = eval_mae_rmse(y_val, pred_val)
+    mae_test, rmse_test = eval_mae_rmse(y_test, pred_test)
+
+    bmae_val,  brmse_val  = eval_mae_rmse(y_val, baseline_val)
+    bmae_test, brmse_test = eval_mae_rmse(y_test, baseline_test)
+
+    resultados.append({
+        "H_horas": H,
+        "MLP_MAE_VAL": mae_val, "MLP_RMSE_VAL": rmse_val,
+        "BASE_MAE_VAL": bmae_val, "BASE_RMSE_VAL": brmse_val,
+        "MLP_MAE_TEST": mae_test, "MLP_RMSE_TEST": rmse_test,
+        "BASE_MAE_TEST": bmae_test, "BASE_RMSE_TEST": brmse_test,
+        "N_train": len(train_df), "N_val": len(val_df), "N_test": len(test_df)
+    })
+
+    # Plot rápido (opcional): 7 dias turbina 1
+    t_id = 1
+    g = test_df[test_df["id"] == t_id].sort_values("datetime").head(24*7).copy()
+    g["y_pred"] = model.predict(g[features_num + features_cat])
+
+    plt.figure()
+    plt.plot(g["datetime"], g["y_target"], label=f"Real t+{H}h")
+    plt.plot(g["datetime"], g["y_pred"], label=f"MLP t+{H}h")
+    plt.plot(g["datetime"], g["wind_speed_80m"], label="Persistência (agora)", alpha=0.7)
+    plt.title(f"Turbina {t_id} - previsão {H}h à frente (7 dias)")
+    plt.xlabel("Data")
+    plt.ylabel("Vento 80m (m/s)")
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# =========================
+# 4) TABELA FINAL
+# =========================
+res = pd.DataFrame(resultados)
+display(res.sort_values("H_horas"))
+
+#============================================
+#============================================
+REDE DE RECORRENCIA - LSTM 
+#============================================
+#============================================
+# -------------------------
+# 0) CONFIG
+# -------------------------
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+LOOKBACK = 24            # janela (horas passadas usadas como sequência)
+HORIZONTES = [3, 6, 12]  # horas à frente
+RNN_TYPE = "LSTM"        # "LSTM" ou "GRU"
+BATCH_SIZE = 256
+EPOCHS = 30
+
+# -------------------------
+# 1) DF BASE
+# -------------------------
+# Espera dfh com colunas:
+# id, datetime (datetime64), wind_speed_80m, u10, v10, elevation, slope
+# e features temporais: hour_sin, hour_cos, doy_sin, doy_cos
+# (se ainda não tiver, crie antes de rodar este bloco)
+
+dfh = dfh.copy()
+dfh = dfh.sort_values(["id", "datetime"]).reset_index(drop=True)
+
+# -------------------------
+# 2) FEATURES (sem one-hot dentro da RNN)
+# -------------------------
+# Observação: para incorporar "id" na RNN, o mais simples é treinar 1 modelo global
+# e incluir "id_norm" como feature numérica.
+# Alternativa mais forte (embeddings) eu te passo depois se quiser.
+
+n_ids = dfh["id"].nunique()
+dfh["id_norm"] = (dfh["id"] - dfh["id"].min()) / (dfh["id"].max() - dfh["id"].min() + 1e-9)
+
+FEATURES = [
+    "u10", "v10", "elevation", "slope",
+    "hour_sin", "hour_cos", "doy_sin", "doy_cos",
+    "id_norm"
+]
+TARGET_COL = "wind_speed_80m"
+
+# -------------------------
+# 3) SPLIT TEMPORAL (igual ao seu experimento)
+# -------------------------
+def split_masks(df):
+    train_mask = df["datetime"] < pd.Timestamp("2024-01-01")
+    val_mask   = (df["datetime"] >= pd.Timestamp("2024-01-01")) & (df["datetime"] < pd.Timestamp("2024-07-01"))
+    test_mask  = df["datetime"] >= pd.Timestamp("2024-07-01")
+    return train_mask, val_mask, test_mask
+
+# -------------------------
+# 4) NORMALIZAÇÃO (fit no TRAIN apenas)
+# -------------------------
+def fit_scalers(train_df):
+    mu = train_df[FEATURES].mean()
+    sd = train_df[FEATURES].std().replace(0, 1.0)
+    mu_y = train_df[TARGET_COL].mean()
+    sd_y = train_df[TARGET_COL].std() if train_df[TARGET_COL].std() != 0 else 1.0
+    return mu, sd, mu_y, sd_y
+
+def apply_scalers(df, mu, sd, mu_y, sd_y):
+    X = (df[FEATURES] - mu) / sd
+    y = (df[TARGET_COL] - mu_y) / sd_y
+    return X.values.astype(np.float32), y.values.astype(np.float32)
+
+# -------------------------
+# 5) DATASET SEQUENCIAL POR TURBINA
+# -------------------------
+def make_sequences_per_id(df, H, lookback, mu, sd, mu_y, sd_y):
+    """
+    Cria (X_seq, y_target, y_persist) para cada turbina, sem misturar ids.
+    X_seq: (N, lookback, n_features)
+    y_target: wind_speed_80m em t+H (normalizado)
+    y_persist: wind_speed_80m em t (não normalizado, para baseline)
+    Também retorna timestamps do alvo e ids, para debug/plot.
+    """
+    X_list, y_list = [], []
+    y_persist_list = []
+    t_list, id_list = [], []
+
+    for tid, g in df.groupby("id"):
+        g = g.sort_values("datetime").reset_index(drop=True)
+
+        # precisa ter lookback + H pontos
+        if len(g) < lookback + H + 1:
+            continue
+
+        Xg, yg = apply_scalers(g, mu, sd, mu_y, sd_y)  # Xg shape (T, F), yg shape (T,)
+
+        # sequência termina em t (índice i), alvo em i+H
+        # janela: [i-lookback+1 ... i]
+        for i in range(lookback-1, len(g)-H):
+            X_seq = Xg[i - (lookback-1): i+1, :]
+            y_tgt = yg[i + H]
+            y_persist = g.loc[i, TARGET_COL]  # baseline: v(t)
+
+            X_list.append(X_seq)
+            y_list.append(y_tgt)
+            y_persist_list.append(y_persist)
+            t_list.append(g.loc[i + H, "datetime"])
+            id_list.append(tid)
+
+    X_out = np.stack(X_list).astype(np.float32)
+    y_out = np.array(y_list).astype(np.float32)
+    y_persist_out = np.array(y_persist_list).astype(np.float32)
+    t_out = np.array(t_list)
+    id_out = np.array(id_list)
+
+    return X_out, y_out, y_persist_out, t_out, id_out
+
+# -------------------------
+# 6) MODELO (LSTM/GRU)
+# -------------------------
+def build_rnn(input_shape, rnn_type="LSTM"):
+    inp = layers.Input(shape=input_shape)
+    x = inp
+
+    if rnn_type.upper() == "GRU":
+        x = layers.GRU(64, return_sequences=True)(x)
+        x = layers.GRU(32)(x)
+    else:
+        x = layers.LSTM(64, return_sequences=True)(x)
+        x = layers.LSTM(32)(x)
+
+    x = layers.Dense(32, activation="relu")(x)
+    out = layers.Dense(1)(x)
+
+    m = models.Model(inp, out)
+    m.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="mse"
+    )
+    return m
+
+# -------------------------
+# 7) MÉTRICAS (desnormalizar)
+# -------------------------
+def eval_mae_rmse(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    return mae, rmse
+
+# -------------------------
+# 8) RODAR MULTI-HORIZONTES
+# -------------------------
+resultados = []
+
+for H in HORIZONTES:
+    # split no df inteiro, depois gerar sequências por split
+    train_mask, val_mask, test_mask = split_masks(dfh)
+
+    train_df = dfh.loc[train_mask].copy()
+    val_df   = dfh.loc[val_mask].copy()
+    test_df  = dfh.loc[test_mask].copy()
+
+    # scalers do treino
+    mu, sd, mu_y, sd_y = fit_scalers(train_df)
+
+    # sequências
+    X_train, y_train, ypers_train, t_train, id_train = make_sequences_per_id(train_df, H, LOOKBACK, mu, sd, mu_y, sd_y)
+    X_val,   y_val,   ypers_val,   t_val,   id_val   = make_sequences_per_id(val_df,   H, LOOKBACK, mu, sd, mu_y, sd_y)
+    X_test,  y_test,  ypers_test,  t_test,  id_test  = make_sequences_per_id(test_df,  H, LOOKBACK, mu, sd, mu_y, sd_y)
+
+    print(f"\nH={H}h  Shapes: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
+
+    # callbacks
+    cb = [
+        callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5)
+    ]
+
+    # treina
+    model = build_rnn(input_shape=X_train.shape[1:], rnn_type=RNN_TYPE)
+    hist = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        verbose=1,
+        callbacks=cb
+    )
+
+    # pred
+    pred_val  = model.predict(X_val,  batch_size=BATCH_SIZE).reshape(-1)
+    pred_test = model.predict(X_test, batch_size=BATCH_SIZE).reshape(-1)
+
+    # desnormalizar y (alvo e predição)
+    y_val_real   = (y_val * sd_y) + mu_y
+    y_test_real  = (y_test * sd_y) + mu_y
+    pred_val_real  = (pred_val * sd_y) + mu_y
+    pred_test_real = (pred_test * sd_y) + mu_y
+
+    # baseline persistência (já está em unidade real)
+    base_val_real  = ypers_val
+    base_test_real = ypers_test
+
+    # métricas
+    mae_val, rmse_val = eval_mae_rmse(y_val_real, pred_val_real)
+    mae_test, rmse_test = eval_mae_rmse(y_test_real, pred_test_real)
+
+    bmae_val, brmse_val = eval_mae_rmse(y_val_real, base_val_real)
+    bmae_test, brmse_test = eval_mae_rmse(y_test_real, base_test_real)
+
+    print(f"[{RNN_TYPE} VAL H={H}]  MAE={mae_val:.3f}  RMSE={rmse_val:.3f}")
+    print(f"[{RNN_TYPE} TEST H={H}] MAE={mae_test:.3f}  RMSE={rmse_test:.3f}")
+    print(f"[BASE PERSIST VAL H={H}]  MAE={bmae_val:.3f}  RMSE={brmse_val:.3f}")
+    print(f"[BASE PERSIST TEST H={H}] MAE={bmae_test:.3f}  RMSE={brmse_test:.3f}")
+
+    resultados.append({
+        "H_horas": H,
+        f"{RNN_TYPE}_MAE_VAL": mae_val, f"{RNN_TYPE}_RMSE_VAL": rmse_val,
+        "BASE_MAE_VAL": bmae_val, "BASE_RMSE_VAL": brmse_val,
+        f"{RNN_TYPE}_MAE_TEST": mae_test, f"{RNN_TYPE}_RMSE_TEST": rmse_test,
+        "BASE_MAE_TEST": bmae_test, "BASE_RMSE_TEST": brmse_test,
+        "N_train_seq": X_train.shape[0],
+        "N_val_seq": X_val.shape[0],
+        "N_test_seq": X_test.shape[0],
+        "lookback": LOOKBACK
+    })
+
+    # -------------------------
+    # 9) PLOT (2 semanas, turbina 1)
+    # -------------------------
+    t_id_plot = 1
+    mask_tid = (id_test == t_id_plot)
+    if mask_tid.sum() > 0:
+        df_plot = pd.DataFrame({
+            "datetime": t_test[mask_tid],
+            "y_true": y_test_real[mask_tid],
+            "y_pred": pred_test_real[mask_tid],
+            "y_persist": base_test_real[mask_tid]
+        }).sort_values("datetime")
+
+        df_plot = df_plot.head(24*7)  # 7 dias
+
+        plt.figure()
+        plt.plot(df_plot["datetime"], df_plot["y_true"], label=f"Real t+{H}h")
+        plt.plot(df_plot["datetime"], df_plot["y_pred"], label=f"{RNN_TYPE} t+{H}h")
+        plt.plot(df_plot["datetime"], df_plot["y_persist"], label="Persistência (v(t))", alpha=0.7)
+        plt.title(f"Turbina {t_id_plot} - {RNN_TYPE} - H={H}h (7 dias)")
+        plt.xlabel("Data")
+        plt.ylabel("Vento 80m (m/s)")
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+# -------------------------
+# 10) TABELA FINAL
+# -------------------------
+res = pd.DataFrame(resultados).sort_values("H_horas")
+display(res)
+
+#======================================================
+#======================================================
+REDE DE RECORRENCIA - GRU 
+#======================================================
+#======================================================
+
+
+# -------------------------
+# 0) CONFIG
+# -------------------------
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+LOOKBACK = 24            # janela (horas passadas usadas como sequência)
+HORIZONTES = [3, 6, 12]  # horas à frente
+RNN_TYPE = "GRU"        # "LSTM" ou "GRU"
+BATCH_SIZE = 256
+EPOCHS = 30
+
+# -------------------------
+# 1) DF BASE
+# -------------------------
+# Espera dfh com colunas:
+# id, datetime (datetime64), wind_speed_80m, u10, v10, elevation, slope
+# e features temporais: hour_sin, hour_cos, doy_sin, doy_cos
+# (se ainda não tiver, crie antes de rodar este bloco)
+
+dfh = dfh.copy()
+dfh = dfh.sort_values(["id", "datetime"]).reset_index(drop=True)
+
+# -------------------------
+# 2) FEATURES (sem one-hot dentro da RNN)
+# -------------------------
+# Observação: para incorporar "id" na RNN, o mais simples é treinar 1 modelo global
+# e incluir "id_norm" como feature numérica.
+# Alternativa mais forte (embeddings) eu te passo depois se quiser.
+
+n_ids = dfh["id"].nunique()
+dfh["id_norm"] = (dfh["id"] - dfh["id"].min()) / (dfh["id"].max() - dfh["id"].min() + 1e-9)
+
+FEATURES = [
+    "u10", "v10", "elevation", "slope",
+    "hour_sin", "hour_cos", "doy_sin", "doy_cos",
+    "id_norm"
+]
+TARGET_COL = "wind_speed_80m"
+
+# -------------------------
+# 3) SPLIT TEMPORAL (igual ao seu experimento)
+# -------------------------
+def split_masks(df):
+    train_mask = df["datetime"] < pd.Timestamp("2024-01-01")
+    val_mask   = (df["datetime"] >= pd.Timestamp("2024-01-01")) & (df["datetime"] < pd.Timestamp("2024-07-01"))
+    test_mask  = df["datetime"] >= pd.Timestamp("2024-07-01")
+    return train_mask, val_mask, test_mask
+
+# -------------------------
+# 4) NORMALIZAÇÃO (fit no TRAIN apenas)
+# -------------------------
+def fit_scalers(train_df):
+    mu = train_df[FEATURES].mean()
+    sd = train_df[FEATURES].std().replace(0, 1.0)
+    mu_y = train_df[TARGET_COL].mean()
+    sd_y = train_df[TARGET_COL].std() if train_df[TARGET_COL].std() != 0 else 1.0
+    return mu, sd, mu_y, sd_y
+
+def apply_scalers(df, mu, sd, mu_y, sd_y):
+    X = (df[FEATURES] - mu) / sd
+    y = (df[TARGET_COL] - mu_y) / sd_y
+    return X.values.astype(np.float32), y.values.astype(np.float32)
+
+# -------------------------
+# 5) DATASET SEQUENCIAL POR TURBINA
+# -------------------------
+def make_sequences_per_id(df, H, lookback, mu, sd, mu_y, sd_y):
+    """
+    Cria (X_seq, y_target, y_persist) para cada turbina, sem misturar ids.
+    X_seq: (N, lookback, n_features)
+    y_target: wind_speed_80m em t+H (normalizado)
+    y_persist: wind_speed_80m em t (não normalizado, para baseline)
+    Também retorna timestamps do alvo e ids, para debug/plot.
+    """
+    X_list, y_list = [], []
+    y_persist_list = []
+    t_list, id_list = [], []
+
+    for tid, g in df.groupby("id"):
+        g = g.sort_values("datetime").reset_index(drop=True)
+
+        # precisa ter lookback + H pontos
+        if len(g) < lookback + H + 1:
+            continue
+
+        Xg, yg = apply_scalers(g, mu, sd, mu_y, sd_y)  # Xg shape (T, F), yg shape (T,)
+
+        # sequência termina em t (índice i), alvo em i+H
+        # janela: [i-lookback+1 ... i]
+        for i in range(lookback-1, len(g)-H):
+            X_seq = Xg[i - (lookback-1): i+1, :]
+            y_tgt = yg[i + H]
+            y_persist = g.loc[i, TARGET_COL]  # baseline: v(t)
+
+            X_list.append(X_seq)
+            y_list.append(y_tgt)
+            y_persist_list.append(y_persist)
+            t_list.append(g.loc[i + H, "datetime"])
+            id_list.append(tid)
+
+    X_out = np.stack(X_list).astype(np.float32)
+    y_out = np.array(y_list).astype(np.float32)
+    y_persist_out = np.array(y_persist_list).astype(np.float32)
+    t_out = np.array(t_list)
+    id_out = np.array(id_list)
+
+    return X_out, y_out, y_persist_out, t_out, id_out
+
+# -------------------------
+# 6) MODELO (GRU)
+# -------------------------
+def build_gru(input_shape):
+    inp = layers.Input(shape=input_shape)
+    x = layers.GRU(64, return_sequences=True)(inp)
+    x = layers.GRU(32)(x)
+    x = layers.Dense(32, activation="relu")(x)
+    out = layers.Dense(1)(x)
+
+    model = tf.keras.Model(inp, out)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="mse"
+    )
+    return model
+
+
+# -------------------------
+# 7) MÉTRICAS (desnormalizar)
+# -------------------------
+def eval_mae_rmse(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    return mae, rmse
+
+# -------------------------
+# 8) RODAR MULTI-HORIZONTES
+# -------------------------
+resultados = []
+
+for H in HORIZONTES:
+    # split no df inteiro, depois gerar sequências por split
+    train_mask, val_mask, test_mask = split_masks(dfh)
+
+    train_df = dfh.loc[train_mask].copy()
+    val_df   = dfh.loc[val_mask].copy()
+    test_df  = dfh.loc[test_mask].copy()
+
+    # scalers do treino
+    mu, sd, mu_y, sd_y = fit_scalers(train_df)
+
+    # sequências
+    X_train, y_train, ypers_train, t_train, id_train = make_sequences_per_id(train_df, H, LOOKBACK, mu, sd, mu_y, sd_y)
+    X_val,   y_val,   ypers_val,   t_val,   id_val   = make_sequences_per_id(val_df,   H, LOOKBACK, mu, sd, mu_y, sd_y)
+    X_test,  y_test,  ypers_test,  t_test,  id_test  = make_sequences_per_id(test_df,  H, LOOKBACK, mu, sd, mu_y, sd_y)
+
+    print(f"\nH={H}h  Shapes: train={X_train.shape}, val={X_val.shape}, test={X_test.shape}")
+
+    # callbacks
+    cb = [
+        callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+        callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5)
+    ]
+
+    # treina
+    model = build_rnn(input_shape=X_train.shape[1:], rnn_type=RNN_TYPE)
+    hist = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        verbose=1,
+        callbacks=cb
+    )
+
+    # pred
+    pred_val  = model.predict(X_val,  batch_size=BATCH_SIZE).reshape(-1)
+    pred_test = model.predict(X_test, batch_size=BATCH_SIZE).reshape(-1)
+
+    # desnormalizar y (alvo e predição)
+    y_val_real   = (y_val * sd_y) + mu_y
+    y_test_real  = (y_test * sd_y) + mu_y
+    pred_val_real  = (pred_val * sd_y) + mu_y
+    pred_test_real = (pred_test * sd_y) + mu_y
+
+    # baseline persistência (já está em unidade real)
+    base_val_real  = ypers_val
+    base_test_real = ypers_test
+
+    # métricas
+    mae_val, rmse_val = eval_mae_rmse(y_val_real, pred_val_real)
+    mae_test, rmse_test = eval_mae_rmse(y_test_real, pred_test_real)
+
+    bmae_val, brmse_val = eval_mae_rmse(y_val_real, base_val_real)
+    bmae_test, brmse_test = eval_mae_rmse(y_test_real, base_test_real)
+
+    print(f"[{RNN_TYPE} VAL H={H}]  MAE={mae_val:.3f}  RMSE={rmse_val:.3f}")
+    print(f"[{RNN_TYPE} TEST H={H}] MAE={mae_test:.3f}  RMSE={rmse_test:.3f}")
+    print(f"[BASE PERSIST VAL H={H}]  MAE={bmae_val:.3f}  RMSE={brmse_val:.3f}")
+    print(f"[BASE PERSIST TEST H={H}] MAE={bmae_test:.3f}  RMSE={brmse_test:.3f}")
+
+    resultados.append({
+        "H_horas": H,
+        f"{RNN_TYPE}_MAE_VAL": mae_val, f"{RNN_TYPE}_RMSE_VAL": rmse_val,
+        "BASE_MAE_VAL": bmae_val, "BASE_RMSE_VAL": brmse_val,
+        f"{RNN_TYPE}_MAE_TEST": mae_test, f"{RNN_TYPE}_RMSE_TEST": rmse_test,
+        "BASE_MAE_TEST": bmae_test, "BASE_RMSE_TEST": brmse_test,
+        "N_train_seq": X_train.shape[0],
+        "N_val_seq": X_val.shape[0],
+        "N_test_seq": X_test.shape[0],
+        "lookback": LOOKBACK
+    })
+
+    # -------------------------
+    # 9) PLOT (2 semanas, turbina 1)
+    # -------------------------
+    t_id_plot = 1
+    mask_tid = (id_test == t_id_plot)
+    if mask_tid.sum() > 0:
+        df_plot = pd.DataFrame({
+            "datetime": t_test[mask_tid],
+            "y_true": y_test_real[mask_tid],
+            "y_pred": pred_test_real[mask_tid],
+            "y_persist": base_test_real[mask_tid]
+        }).sort_values("datetime")
+
+        df_plot = df_plot.head(24*7)  # 7 dias
+
+        plt.figure()
+        plt.plot(df_plot["datetime"], df_plot["y_true"], label=f"Real t+{H}h")
+        plt.plot(df_plot["datetime"], df_plot["y_pred"], label=f"{RNN_TYPE} t+{H}h")
+        plt.plot(df_plot["datetime"], df_plot["y_persist"], label="Persistência (v(t))", alpha=0.7)
+        plt.title(f"Turbina {t_id_plot} - {RNN_TYPE} - H={H}h (7 dias)")
+        plt.xlabel("Data")
+        plt.ylabel("Vento 80m (m/s)")
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+
+# -------------------------
+# 10) TABELA FINAL
+# -------------------------
+res = pd.DataFrame(resultados).sort_values("H_horas")
+display(res)
+
+# ==========================================================
 # ==========================================================
 # TCN
 # ==========================================================
+# ==========================================================
+
 def tcn_residual_block(x, filters, kernel_size, dilation_rate, dropout=0.15):
     prev = x
 
